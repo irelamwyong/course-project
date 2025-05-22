@@ -1,0 +1,576 @@
+import yfinance as yf
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from keras.models import Sequential
+from keras.layers import LSTM, Dense,RepeatVector, TimeDistributed
+from keras.callbacks import EarlyStopping
+import matplotlib.pyplot as plt
+from datetime import datetime,timedelta
+from xgboost import XGBRegressor
+print(XGBRegressor)
+
+ticker = 'KO'
+n_days = 1 #Predict 1 day forward
+sequence_length = 60 #Will use past 60 days'prices to predict the next day
+test_size = 0.2 #20% of the data will be used for testing
+
+start_date = '2015-01-01'
+end_date = datetime.today().strftime('%Y-%m-%d')
+
+df = yf.download(ticker, start=start_date, end=end_date)
+df.columns = df.columns.droplevel(1)
+df.dropna(inplace=True)
+df
+
+# Visualize the raw data (closing price)
+plt.figure(figsize=(12, 5))
+plt.plot(df['Close'], label=f'{ticker} Close Price', color='steelblue')
+plt.title(f'{ticker} Stock Closing Price History')
+plt.xlabel('Date')
+plt.ylabel('Close Price')
+plt.grid(True)
+plt.legend()
+plt.show()
+
+
+def create_features(df, lags=[1, 3, 5, 10, 20], sma_windows=[5, 10, 20, 60], vol_window=20):
+    """
+    Create feature factors based on OHLCV data.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing OHLCV data, indexed by datetime
+        lags (list): List of lags for calculating log returns
+        sma_windows (list): List of window sizes for calculating simple moving averages (SMA)
+        vol_window (int): Window size for calculating volatility
+
+    Returns:
+        pd.DataFrame: DataFrame containing generated features (rows with NaNs removed)
+    """
+    print("Starting feature engineering...")
+    df_feat = df.copy()
+    
+    # Calculate log return (clip to avoid division errors with 0 or negative prices)
+    df_feat['log_return'] = np.log(df_feat['Close'].clip(lower=1e-9) / df_feat['Close'].shift(1).clip(lower=1e-9))
+    
+    # Lagged log return features
+    for lag in lags:
+        df_feat[f'log_return_lag{lag}'] = df_feat['log_return'].shift(lag)
+        
+    # Simple Moving Average (SMA) features
+    for window in sma_windows:
+        df_feat[f'sma_{window}'] = df_feat['Close'].rolling(window=window, min_periods=1).mean()
+        # Ratio of price to its SMA (avoid division by zero)
+        df_feat[f'price_sma_{window}_ratio'] = df_feat['Close'] / df_feat[f'sma_{window}'].replace(0, 1e-9)
+        
+    # Ratio between short-term and long-term SMAs
+    if len(sma_windows) >= 2:
+        sma_short = f'sma_{sma_windows[0]}'
+        sma_long = f'sma_{sma_windows[-1]}'
+        df_feat[f'sma_ratio'] = df_feat[sma_short] / df_feat[sma_long].replace(0, 1e-9)
+
+    # Volatility feature (std dev of log return over rolling window)
+    df_feat[f'volatility_{vol_window}'] = df_feat['log_return'].rolling(window=vol_window, min_periods=1).std()
+    
+    # Volume-based feature: ratio to rolling mean volume (avoid divide-by-zero)
+    vol_mean = df_feat['Volume'].rolling(window=vol_window, min_periods=1).mean()
+    df_feat['volume_change_ratio'] = df_feat['Volume'] / vol_mean.replace(0, 1)
+
+    # Drop rows with NaN values (usually caused by lags or rolling windows)
+    df_feat = df_feat.dropna() 
+    print(f"Feature engineering complete. Generated {len(df_feat.columns) - len(df.columns)} new features. Remaining rows: {len(df_feat)}")
+    return df_feat
+
+
+df = create_features(df, lags=[1, 3, 5, 10, 20], sma_windows=[5, 10, 20, 60], vol_window=20)
+df.head()
+
+def feature_selection_with_xgb(df_feat, target_col='close', top_k=10):
+    # define target and features
+    X = df_feat.drop(columns=[target_col])
+    y = df_feat[target_col]
+    
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, shuffle=False)
+    
+    # Use XGBoost for feature importance
+    model = XGBRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)],verbose=False)
+    
+    # Get feature importance
+    importance = model.feature_importances_
+    features = X.columns
+    
+    # Create a DataFrame for feature importance
+    imp_df = pd.DataFrame({'feature': features, 'importance': importance})
+    imp_df = imp_df.sort_values(by='importance', ascending=False).head(top_k)
+    
+    plt.figure(figsize=(8, 6))
+    plt.barh(imp_df['feature'], imp_df['importance'])
+    plt.xlabel('Feature Importance')
+    plt.title(f'Top {top_k} Important Features by XGBoost')
+    plt.gca().invert_yaxis()
+    plt.show()
+    
+    return imp_df['feature'].tolist()
+
+
+top_features = feature_selection_with_xgb(df, target_col='Close', top_k=10)
+print("Selected features:", top_features)
+
+
+df = df[['Close'] + top_features]
+df = df.dropna()
+df.head()
+
+# Choosing between Standardization or normalization
+# sc=StandardScaler()
+scaler = MinMaxScaler()
+data_scaled = scaler.fit_transform(df)
+scaled_df = pd.DataFrame(data_scaled, columns=df.columns, index=df.index)
+
+
+# Building the sample for the LSTM
+X, y, dates = [], [], []
+for i in range(len(scaled_df) - sequence_length - n_days):
+    X.append(scaled_df.iloc[i:i+sequence_length].values)
+    y.append(scaled_df.iloc[i+sequence_length:i+sequence_length+n_days]['Close'].values)
+    dates.append(scaled_df.index[i+sequence_length:i+sequence_length+n_days])
+
+X = np.array(X)
+y = np.array(y).reshape(-1, n_days)
+dates = np.array(dates)
+
+
+print('X shape:', X.shape)
+print('y shape:', y.shape)
+print('y_dates shape:', dates.shape)
+
+X_train, X_test, y_train, y_test, dates_train, dates_test = train_test_split(X, y, dates, test_size=test_size, shuffle=False)
+
+# Building the LSTM model
+model = Sequential()
+model.add(LSTM(units=64, activation='tanh', input_shape=(sequence_length, X.shape[2]), return_sequences=True))
+model.add(LSTM(units=32, activation='tanh', return_sequences=False))
+model.add(RepeatVector(n_days))
+model.add(LSTM(32, activation='tanh', return_sequences=True))
+model.add(TimeDistributed(Dense(1)))
+model.compile(optimizer='adam', loss='mse')
+
+early_stop = EarlyStopping(
+    monitor='val_loss',      
+    patience= 25, 
+    min_delta=0.0001, 
+    verbose=1,             
+    restore_best_weights=True 
+)
+
+model.fit(
+    X_train,
+    y_train,
+    epochs=100,
+    batch_size=32,
+    validation_split=0.2,
+    callbacks=[early_stop],
+    verbose=1
+)
+
+y_pred = model.predict(X_test)
+y_pred = y_pred.squeeze()
+print('y_pred shape:', y_pred.shape)
+
+close_idx = df.columns.get_loc('Close')
+
+y_test_full, y_pred_full = [], []
+for i in range(len(y_test)):
+    temp = np.zeros((n_days, data_scaled.shape[1]))
+    temp[:, close_idx] = y_test[i]
+    y_test_full.append(scaler.inverse_transform(temp)[:, close_idx])
+
+    temp[:, close_idx] = y_pred[i]
+    y_pred_full.append(scaler.inverse_transform(temp)[:, close_idx])
+
+y_test_flat = np.array(y_test_full).flatten()
+y_pred_flat = np.array(y_pred_full).flatten()
+
+rmse = np.sqrt(mean_squared_error(y_test_flat, y_pred_flat))
+mae = mean_absolute_error(y_test_flat, y_pred_flat)
+print(f'RMSE: {rmse:.2f}')
+print(f'MAE: {mae:.2f}')
+
+plt.figure(figsize=(14, 6))
+plt.plot(dates_test.flatten(), np.array(y_test_flat), label='True', color='lightblue')
+plt.plot(dates_test.flatten(), np.array(y_pred_flat), label='Predicted', linestyle='--', color='orange')
+plt.title(f'{ticker} LSTM Forecast on Test Set')
+plt.xlabel('Date')
+plt.ylabel('Price')
+plt.legend()
+plt.grid()
+plt.show()
+
+
+future_predictions = []
+prediction_length = n_days
+input_seq = data_scaled[-sequence_length:].reshape((1, sequence_length, data_scaled.shape[1]))
+
+pred = model.predict(input_seq)  # shape: (1, n_steps_out, 1)
+pred_close_scaled = pred[0, :, 0]  # shape: (n_steps_out,)
+future_predictions = pred_close_scaled.tolist()
+
+temp = np.zeros((n_days, data_scaled.shape[1]))
+temp[:, close_idx] = future_predictions
+future_pred_prices = scaler.inverse_transform(temp)[:, close_idx]
+
+print(f"Future predictions for the next {n_days} days: {future_pred_prices}")
+
+data_predict = yf.download(ticker, start='2025-05-02', end='2025-05-03')
+
+# Actual Close prices for the next day
+print(data_predict['Close'])
+
+# === TRANSFORMER MODEL START ===
+
+# === [Imports] ===
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+from datetime import datetime,timedelta
+from xgboost import XGBRegressor
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+ticker = 'KO'
+
+# === [Hyperparameters] ===
+n_days = 1 #Predict 1 day forward
+sequence_length = 60 # Will use past 60 days'prices to predict the next day
+test_size = 0.2 #20% of the data will be used for testing
+embed_dim = 32
+num_heads = 2
+ff_dim = 32
+num_blocks = 2
+dropout = 0.1
+lr = 0.001
+batch_size = 32
+epochs = 100
+
+start_date = '2015-01-01'
+end_date = datetime.today().strftime('%Y-%m-%d')
+
+df = yf.download(ticker, start=start_date, end=end_date)
+df.columns = df.columns.droplevel(1)
+df.dropna(inplace=True)
+df
+
+# Visualize the raw data (closing price)
+plt.figure(figsize=(12, 5))
+plt.plot(df['Close'], label=f'{ticker} Close Price', color='steelblue')
+plt.title(f'{ticker} Stock Closing Price History')
+plt.xlabel('Date')
+plt.ylabel('Close Price')
+plt.grid(True)
+plt.legend()
+plt.show()
+
+
+def create_features(df, lags=[1, 3, 5, 10, 20], sma_windows=[5, 10, 20, 60], vol_window=20):
+    """
+    Create feature factors based on OHLCV data.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing OHLCV data, indexed by datetime
+        lags (list): List of lags for calculating log returns
+        sma_windows (list): List of window sizes for calculating simple moving averages (SMA)
+        vol_window (int): Window size for calculating volatility
+
+    Returns:
+        pd.DataFrame: DataFrame containing generated features (rows with NaNs removed)
+    """
+    print("Starting feature engineering...")
+    df_feat = df.copy()
+
+    # Calculate log return (clip to avoid division errors with 0 or negative prices)
+    df_feat['log_return'] = np.log(df_feat['Close'].clip(lower=1e-9) / df_feat['Close'].shift(1).clip(lower=1e-9))
+
+    # Lagged log return features
+    for lag in lags:
+        df_feat[f'log_return_lag{lag}'] = df_feat['log_return'].shift(lag)
+
+    # Simple Moving Average (SMA) features
+    for window in sma_windows:
+        df_feat[f'sma_{window}'] = df_feat['Close'].rolling(window=window, min_periods=1).mean()
+        # Ratio of price to its SMA (avoid division by zero)
+        df_feat[f'price_sma_{window}_ratio'] = df_feat['Close'] / df_feat[f'sma_{window}'].replace(0, 1e-9)
+
+    # Ratio between short-term and long-term SMAs
+    if len(sma_windows) >= 2:
+        sma_short = f'sma_{sma_windows[0]}'
+        sma_long = f'sma_{sma_windows[-1]}'
+        df_feat[f'sma_ratio'] = df_feat[sma_short] / df_feat[sma_long].replace(0, 1e-9)
+
+    # Volatility feature (std dev of log return over rolling window)
+    df_feat[f'volatility_{vol_window}'] = df_feat['log_return'].rolling(window=vol_window, min_periods=1).std()
+
+    # Volume-based feature: ratio to rolling mean volume (avoid divide-by-zero)
+    vol_mean = df_feat['Volume'].rolling(window=vol_window, min_periods=1).mean()
+    df_feat['volume_change_ratio'] = df_feat['Volume'] / vol_mean.replace(0, 1)
+
+    # Drop rows with NaN values (usually caused by lags or rolling windows)
+    df_feat = df_feat.dropna()
+    print(f"Feature engineering complete. Generated {len(df_feat.columns) - len(df.columns)} new features. Remaining rows: {len(df_feat)}")
+    return df_feat
+
+
+df = create_features(df, lags=[1, 3, 5, 10, 20], sma_windows=[5, 10, 20, 60], vol_window=20)
+df.head()
+
+def feature_selection_with_xgb(df_feat, target_col='close', top_k=10):
+    # define target and features
+    X = df_feat.drop(columns=[target_col])
+    y = df_feat[target_col]
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, shuffle=False)
+
+    # Use XGBoost for feature importance
+    model = XGBRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)],verbose=False)
+
+    # Get feature importance
+    importance = model.feature_importances_
+    features = X.columns
+
+    # Create a DataFrame for feature importance
+    imp_df = pd.DataFrame({'feature': features, 'importance': importance})
+    imp_df = imp_df.sort_values(by='importance', ascending=False).head(top_k)
+
+    plt.figure(figsize=(8, 6))
+    plt.barh(imp_df['feature'], imp_df['importance'])
+    plt.xlabel('Feature Importance')
+    plt.title(f'Top {top_k} Important Features by XGBoost')
+    plt.gca().invert_yaxis()
+    plt.show()
+
+    return imp_df['feature'].tolist()
+
+
+top_features = feature_selection_with_xgb(df, target_col='Close', top_k=10)
+print("Selected features:", top_features)
+
+
+df = df[['Close'] + top_features]
+df = df.dropna()
+df.head()
+
+# Choosing between Standardization or normalization
+# sc=StandardScaler()
+scaler = MinMaxScaler()
+data_scaled = scaler.fit_transform(df)
+scaled_df = pd.DataFrame(data_scaled, columns=df.columns, index=df.index)
+
+
+# Building the sample for the LSTM
+X, y, dates = [], [], []
+for i in range(len(scaled_df) - sequence_length - n_days):
+    X.append(scaled_df.iloc[i:i+sequence_length].values)
+    y.append(scaled_df.iloc[i+sequence_length:i+sequence_length+n_days]['Close'].values)
+    dates.append(scaled_df.index[i+sequence_length:i+sequence_length+n_days])
+
+X = np.array(X)
+y = np.array(y)
+dates = np.array(dates)
+
+print('X shape:', X.shape)
+print('y shape:', y.shape)
+print('y_dates shape:', dates.shape)
+
+# Train-test split (80% train, 20% test)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+# Convert to tensors
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+
+# Loaders
+test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+# === [Positional Encoding Module] ===
+class EarlyStopping:
+    def __init__(self, patience=25, delta=1e-4):
+        self.patience = patience
+        self.delta = delta
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.best_state = None
+        self.early_stop = False
+
+    def __call__(self, val_loss, model):
+        if val_loss < self.best_loss - self.delta:
+            self.best_loss = val_loss
+            self.best_state = model.state_dict()
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=500):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div_term)
+        pe[:, 1::2] = torch.cos(pos * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+# === [Transformer Model] ===
+class TransformerTimeSeries(nn.Module):
+    def __init__(self, embed_dim, num_heads, ff_dim, seq_length, num_blocks, num_features, dropout):
+        super().__init__()
+        self.input_linear = nn.Linear(num_features, embed_dim)
+        self.pos_encoding = PositionalEncoding(embed_dim, max_len=seq_length)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            activation="relu"
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_blocks)
+        self.fc_out = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(embed_dim * seq_length, 1)
+        )
+    def forward(self, x):
+        x = self.input_linear(x)
+        x = self.pos_encoding(x)
+        x = self.transformer_encoder(x)
+        return self.fc_out(x)
+
+from sklearn.model_selection import train_test_split
+
+# === [Split training set into actual train and validation sets] ===
+X_train_actual, X_val, y_train_actual, y_val = train_test_split(
+    X_train, y_train, test_size=0.2, shuffle=False
+)
+
+# Convert to tensors
+X_train_tensor = torch.tensor(X_train_actual, dtype=torch.float32)
+y_train_tensor = torch.tensor(y_train_actual, dtype=torch.float32)
+X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+y_val_tensor = torch.tensor(y_val, dtype=torch.float32)
+
+# Dataloaders
+train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+# Model, criterion, optimizer (same as before)
+num_features = X_train_tensor.shape[2]
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = TransformerTimeSeries(embed_dim, num_heads, ff_dim, sequence_length, num_blocks, num_features, dropout).to(device)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+# Early stopping
+early_stopping = EarlyStopping(patience=25)
+
+# Training loop with validation
+for epoch in range(epochs):
+    model.train()
+    total_loss = 0
+    for batch_X, batch_y in train_loader:
+        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+        optimizer.zero_grad()
+        pred = model(batch_X)
+        loss = criterion(pred.squeeze(), batch_y.squeeze())
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    avg_train_loss = total_loss / len(train_loader)
+
+    # Validation loss
+    model.eval()
+    with torch.no_grad():
+        val_pred = model(X_val_tensor.to(device))
+        val_loss = criterion(val_pred.squeeze(), y_val_tensor.to(device).squeeze()).item()
+
+    print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss:.6f}")
+
+    early_stopping(val_loss, model)
+    if early_stopping.early_stop:
+        print("Early stopping triggered.")
+        break
+
+# Restore best model weights
+model.load_state_dict(early_stopping.best_state)
+
+
+# === [Evaluate on Test Set and Inverse Transform] ===
+model.eval()
+with torch.no_grad():
+    test_preds = model(X_test_tensor.to(device)).cpu().numpy().flatten()
+    test_actual = y_test_tensor.numpy().flatten()
+
+# Inverse transform predictions and actual values
+close_idx = df.columns.get_loc('Close')
+
+y_test_full, y_pred_full = [], []
+for i in range(len(y_test)):
+    temp = np.zeros((n_days, data_scaled.shape[1]))
+    temp[:, close_idx] = y_test[i]
+    y_test_full.append(scaler.inverse_transform(temp)[:, close_idx])
+
+    temp[:, close_idx] = test_preds[i]
+    y_pred_full.append(scaler.inverse_transform(temp)[:, close_idx])
+
+y_test_flat = np.array(y_test_full).flatten()
+y_pred_flat = np.array(y_pred_full).flatten()
+
+rmse = np.sqrt(mean_squared_error(y_test_flat, y_pred_flat))
+mae = mean_absolute_error(y_test_flat, y_pred_flat)
+print(f'RMSE: {rmse:.2f}')
+print(f'MAE: {mae:.2f}')
+
+# === [Plot Predicted vs Actual on Test Set] ===
+plt.figure(figsize=(14, 6))
+plt.plot(dates_test.flatten(), np.array(y_test_flat), label='True', color='lightblue')
+plt.plot(dates_test.flatten(), np.array(y_pred_flat), label='Predicted', linestyle='--', color='orange')
+plt.title(f'{ticker} Transformer Forecast on Test Set')
+plt.xlabel('Date')
+plt.ylabel('Price')
+plt.legend()
+plt.grid()
+plt.show()
+
+future_predictions = []
+prediction_length = n_days
+input_seq = data_scaled[-sequence_length:].reshape((1, sequence_length, data_scaled.shape[1]))
+
+pred = model(torch.tensor(input_seq, dtype=torch.float32))  # shape: (1, n_steps_out, 1)
+pred_close_scaled = pred[0, :]  # shape: (n_steps_out,)
+future_predictions = pred_close_scaled.tolist()
+
+temp = np.zeros((n_days, data_scaled.shape[1]))
+temp[:, close_idx] = future_predictions
+future_pred_prices = scaler.inverse_transform(temp)[:, close_idx]
+
+print(f"Future predictions for the next {n_days} days: {future_pred_prices}")
+
+data_predict = yf.download(ticker, start='2025-05-02', end='2025-05-03')
+
+# Actual Close prices for the next day
+print(data_predict['Close'])
