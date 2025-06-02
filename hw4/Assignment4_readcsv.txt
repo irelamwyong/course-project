@@ -1,0 +1,17 @@
+import numpy as np
+import pandas as pd
+# === [Upload CSV if needed] ===
+from google.colab import files
+uploaded = files.upload()  # Upload a file named 'Assignment4_2025_data.csv'
+df_raw = pd.read_csv('Assignment4_2025_data.csv', skiprows=2)
+print(df_raw.columns)  # See the actual column names in the CSV
+print(len(df_raw.columns))  # Count the columns
+
+# === [Load and Prepare Data] ===
+df_raw = pd.read_csv('Assignment4_2025_data.csv', skiprows=2)
+df_raw.columns = ['Date', 'SOFR','DGS1MO','DGS3MO','DGS6MO','DGS1','DGS2','DGS3','DGS5','DGS7','DGS10','DGS20','DGS30']
+df_raw['Date'] = pd.to_datetime(df_raw['Date'])
+df_raw.set_index('Date', inplace=True)
+df_raw.sort_index(inplace=True)
+data = df_raw.copy()
+symbol_list = ['SOFR','DGS1MO','DGS3MO','DGS6MO','DGS1','DGS2','DGS3','DGS5','DGS7','DGS10','DGS20','DGS30']
